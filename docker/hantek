@@ -1,0 +1,8 @@
+#!/bin/bash
+# Launch Hantek 6000BD software in Docker
+# Install: sudo cp this-file /usr/local/bin/hantek && sudo chmod +x /usr/local/bin/hantek
+
+exec docker run --rm \
+    -p 6080:6080 \
+    --device /dev/bus/usb \
+    hantek-6000bd
