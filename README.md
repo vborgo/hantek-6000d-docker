@@ -1,23 +1,26 @@
 # Hantek 6000D — Docker / Wine Setup
 
-Runs the official Hantek 6000D Windows software (`Scope.exe`) inside Wine on Ubuntu 24.04, accessible from any browser via noVNC.
+Runs the official Hantek 6000D Windows software (`Scope.exe`) inside Wine on Ubuntu 24.04, accessible from any browser via noVNC — or as a native-looking desktop app via `launch-hantek.sh`.
 
 ## Requirements
 
 - Docker
-- The installer directory at `references/Hantek-6000_Ver2.2.7_D20220325/` (relative to project root)
+- The installer directory `Hantek-6000_Ver2.2.7_D20220325/` at the project root
 
 ## Quick Start
 
 ```bash
-# 1. Build the image (once)
-./build-hantek6000d-docker.sh
+# 1. Install udev rules on the host (once — makes the USB device accessible)
+sudo cp 99-hantek.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
 
-# 2. Run
-./run-hantek6000d-docker.sh
+# 2. Build the image (once)
+bash build-hantek6000d-docker.sh
 
-# 3. Open in browser
-http://localhost:6080/vnc.html
+# 3. Plug in the oscilloscope, then launch
+bash launch-hantek.sh          # opens as a desktop app (recommended)
+# or
+bash run-hantek6000d-docker.sh # opens in browser at http://localhost:6080/vnc.html
 ```
 
 ## Files
@@ -25,11 +28,25 @@ http://localhost:6080/vnc.html
 | File | Purpose |
 |------|---------|
 | `Dockerfile` | Ubuntu 24.04 + WineHQ stable + desktop stack + Hantek install |
-| `docker/install.sh` | Runs at build time: inits Wine prefix, installs MFC42, runs `Setup.EXE` |
+| `docker/install.sh` | Build-time: Wine prefix init, MFC42, `Setup.EXE`, driver staging + registry |
+| `docker/start-scope.sh` | Runtime: enumerates USB device in Wine, binds driver, launches `Scope.exe` |
 | `docker/start.sh` | Runtime entrypoint: starts supervisord |
 | `docker/supervisord.conf` | Process manager: Xvfb → Fluxbox → x11vnc → noVNC → Scope.exe |
+| `launch-hantek.sh` | Starts the container + opens the UI as a borderless desktop-app window |
+| `run-hantek6000d-docker.sh` | Starts the container in the foreground (useful for log inspection) |
 | `build-hantek6000d-docker.sh` | Convenience build script |
-| `run-hantek6000d-docker.sh` | Convenience run script |
+| `99-hantek.rules` | Host udev rule: sets `MODE="0666"` for VID `04b5` / PID `6cde` |
+| `hantek-wine-native/` | Reference: native Wine+Hantek install on Ubuntu 24 (no Docker) |
+
+## Desktop App Mode
+
+`launch-hantek.sh` starts the container in the background, waits for noVNC to be ready, then opens a Chromium/Chrome window in `--app` mode — no address bar, no tabs, just the oscilloscope UI in its own window. Closing the window stops the container automatically.
+
+```bash
+bash launch-hantek.sh
+```
+
+Requires Chrome or Chromium. Falls back to Firefox `--kiosk` mode if neither is found.
 
 ## Desktop Stack
 
@@ -37,36 +54,104 @@ http://localhost:6080/vnc.html
 Browser → noVNC (:6080) → x11vnc (:5900) → Xvfb (:1) → Fluxbox + Wine/Scope.exe
 ```
 
-- **Xvfb** — headless X11 display
+- **Xvfb** — headless X11 display (2560×1600)
 - **Fluxbox** — minimal window manager
 - **x11vnc** — exposes the display over VNC
-- **noVNC** — serves VNC over WebSocket so any browser can connect, no VNC client needed
+- **noVNC** — serves VNC over WebSocket; any browser connects, no VNC client needed
 
 ## USB Device Passthrough
 
-To connect the oscilloscope to the container:
+### udev rule (host, once)
 
 ```bash
-# Find the device
-lsusb | grep -i 04b5  # Hantek VID
-
-# Pass through all USB (run-hantek6000d-docker.sh already does this)
-docker run --rm -p 6080:6080 --device /dev/bus/usb hantek-6000bd
+sudo cp 99-hantek.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 ```
 
-> Note: `Scope.exe` may show a "device not found" error inside Wine — this is expected. The USB kernel driver (`USBD.SYS` / `CyUSB.dll`) does not load under Wine. The UI is still fully usable for protocol observation.
+Sets `MODE="0666"` for VID `04b5` / PID `6cde` so the device is accessible without root.
 
-## Install System-Wide
-
-To run `build-hantek6000d-docker` and `run-hantek6000d-docker` from anywhere:
+### Verify the device is visible
 
 ```bash
-sudo ln -s $(pwd)/build-hantek6000d-docker.sh /usr/local/bin/build-hantek6000d-docker
-sudo ln -s $(pwd)/run-hantek6000d-docker.sh   /usr/local/bin/run-hantek6000d-docker
+lsusb | grep 04b5   # should show: ROHM LSI Systems USA, LLC DSO Device
 ```
+
+### How USB works inside the container
+
+The run scripts bind-mount `/dev/bus/usb` and `/sys/bus/usb` into the container and allow access to character device major 189 via `--device-cgroup-rule`. Inside Wine, `wineusb.sys` (Wine 6+) wraps `libusb-1.0` to enumerate USB devices and expose them to Windows drivers. When `Scope.exe` opens the device, the call stack is:
+
+```
+Scope.exe → HTHardDll.dll → Hantek6000BAMD64.SYS → wineusb.sys → libusb-1.0 → host kernel → oscilloscope
+```
+
+---
+
+## Technical: Challenges and Solutions
+
+Getting Wine's Windows kernel driver to bind to the USB device inside Docker involved three separate bugs, each found by isolating native Wine (`hantek-wine-native/`) from the Docker setup (`hantek-docker-usb/`) before touching this project.
+
+### 1. Wrong registry key target — `reg: Invalid system key`
+
+**Problem:** `docker/start-scope.sh` called `wine reg query VID_04B5&PID_6CDE` (without `/s`) to discover the device's instance path, then tried to write driver bindings to the result. Without `/s`, Wine's `reg.exe` only returns the **parent container key** (`...\Enum\USB\VID_04B5&PID_6CDE`) — not the actual device instance subkey (`...\VID_04B5&PID_6CDE\512&0&3&2`). Writing values directly to the parent enumeration key fails with "Invalid system key".
+
+The instance ID (`512&0&3&2`) is runtime-generated by `wineusb.sys` from the USB bus topology — it is not the `0000` or `0000000000000000` that documentation often assumes.
+
+**Fix:** Use `wine reg query ... /s` (recursive) and grep for paths that have a backslash *after* `PID_6CDE` — those are instance subkeys, not the container:
+
+```bash
+INSTANCE=$(wine reg query "HKLM\\..\\VID_04B5&PID_6CDE" /s 2>/dev/null \
+    | tr -d '\r' | grep "^HKEY" | grep -i "PID_6CDE\\\\" \
+    | head -1 | sed 's/HKEY_LOCAL_MACHINE/HKLM/')
+```
+
+### 2. PnP race condition — driver loaded as orphan
+
+**Problem:** Even with correct registry bindings, Wine's `plugplay.exe` was not auto-loading the Oscilloscope driver. The sequence was:
+
+1. `wine reg query` starts `wineserver` → `wineusb.sys` enumerates USB → fires device-arrival event to `plugplay.exe`
+2. `plugplay.exe` looks up `Service=` for the device instance → nothing found yet
+3. Script writes `Service=Oscilloscope` to the instance key
+4. `plugplay.exe` has already moved on — it never re-checks
+
+The fallback `wine sc start Oscilloscope` gets the service to STATE 4 (RUNNING), but without PnP calling `AddDevice`, the driver has no USB PDO wired to it. It runs "blind" — `Scope.exe` opens the device path and gets "no such device".
+
+**Fix:** After writing registry bindings, kill `wineserver` and re-touch the USB registry. This forces a completely fresh enumeration — this time `plugplay.exe` finds `Service=Oscilloscope` already in place and calls `AddDevice` with the real USB PDO:
+
+```bash
+wineserver -k 2>/dev/null || true
+sleep 3
+wine reg query "HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USB" > /dev/null 2>&1 || true
+# now wait for plugplay to auto-load the driver via the driverstore
+```
+
+With this fix, `Oscilloscope service RUNNING (PnP auto-loaded)` replaces the previous "falling back to sc start" message, and the driver is wired to the real hardware.
+
+### 3. USB interface claim conflict
+
+**Problem:** `libusb` allows only one holder of `USBDEVFS_CLAIMINTERFACE` per USB device at a time. If the native Wine from `hantek-wine-native/` was still running (e.g., from a prior test), its libusb held the interface claimed. The Docker container's `wineusb.sys` then received `EBUSY` when trying to claim the same interface — the device appeared in Wine's USB registry, the driver loaded, but `Scope.exe` still reported "device not found".
+
+**Fix:** Before starting Docker, kill any native wineserver that may be holding the device:
+
+```bash
+WINEPREFIX=~/.wine-hantek wineserver -k 2>/dev/null
+```
+
+---
 
 ## Build Notes
 
 - `MFC42u.DLL` (Microsoft Foundation Classes) is installed via `winetricks -q mfc42` — required by `Scope.exe`
 - The Wise installer (`Setup.EXE /S`) is killed after 60 seconds to avoid hanging on a completion dialog
-- Installed to `C:\Program Files\Hantek6000\Scope.exe` inside the Wine prefix
+- The AMD64 kernel driver (`Hantek6000BAMD64.SYS`) is staged in Wine's driverstore at build time so `plugplay.exe` can auto-load it at runtime when the device connects
+- `Scope.exe` installs to `C:\Program Files (x86)\Hantek6000\Scope.exe` (32-bit app in a 64-bit Wine prefix)
+
+## Reference: Native Wine Install
+
+`hantek-wine-native/` contains scripts to install and run the Hantek software directly on an Ubuntu 24 host without Docker — useful for isolating Wine issues from Docker/USB passthrough issues:
+
+```bash
+sudo bash hantek-wine-native/setup-wine.sh    # install WineHQ stable on host
+bash hantek-wine-native/install-hantek.sh     # set up Wine prefix + install Hantek
+bash hantek-wine-native/start-scope.sh        # launch Scope.exe natively
+```

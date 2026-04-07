@@ -1,0 +1,3 @@
+# Hantek 6000D oscilloscope (VID 04b5, PID 6cde)
+# Install on host: sudo cp 99-hantek.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04b5", ATTRS{idProduct}=="6cde", MODE="0666"

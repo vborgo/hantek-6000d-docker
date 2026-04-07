@@ -14,5 +14,8 @@ echo "Open in browser: http://localhost:$PORT/vnc.html"
 
 docker run --rm \
     -p "$PORT:6080" \
-    --device /dev/bus/usb \
+    -v /dev/bus/usb:/dev/bus/usb \
+    --device-cgroup-rule='c 189:* rmw' \
+    -v /sys/bus/usb:/sys/bus/usb:ro \
+    -v /sys/devices:/sys/devices:ro \
     "$IMAGE"

@@ -2,7 +2,7 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:1 \
-    WINEARCH=win32 \
+    WINEARCH=win64 \
     WINEPREFIX=/root/.wine \
     WINEDLLOVERRIDES="mscoree,mshtml="
 
@@ -27,6 +27,9 @@ RUN dpkg --add-architecture i386 && \
         winbind \
         winetricks \
         cabextract \
+        libusb-1.0-0 \
+        libusb-1.0-0:i386 \
+        usbutils \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Copy Hantek software and scripts ---
@@ -34,7 +37,9 @@ COPY Hantek-6000_Ver2.2.7_D20220325/ /hantek/installer/
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/install.sh /hantek/install.sh
 COPY docker/start.sh /hantek/start.sh
-RUN chmod +x /hantek/install.sh /hantek/start.sh
+COPY docker/bind-hantek-usb.sh /hantek/bind-hantek-usb.sh
+COPY docker/start-scope.sh /hantek/start-scope.sh
+RUN chmod +x /hantek/install.sh /hantek/start.sh /hantek/bind-hantek-usb.sh /hantek/start-scope.sh
 
 # --- Bootstrap Wine prefix and install Hantek software ---
 RUN bash /hantek/install.sh
